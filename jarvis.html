@@ -587,7 +587,7 @@
      Pegá acá la URL de tu Cloudflare Worker una vez que lo hayas desplegado
      (ver jarvis-ai-bridge-worker.js). Mientras diga "TU-WORKER", el núcleo de IA
      queda desconectado en esta versión standalone, igual que antes. */
-  var AI_BRIDGE_URL = "https://broad-leaf-41a6jarvis-bridge.jperaltaturri.workers.dev";
+  var AI_BRIDGE_URL = "https://TU-WORKER.workers.dev";
 
   /* ---------------- clock + greeting ---------------- */
   function updateClock(){
@@ -707,6 +707,45 @@
   var localProjectSeq = 0;
   var activeTagFilter = 'Todas';
   var searchQuery = '';
+
+  /* Persistencia en el navegador (localStorage) para cuando no hay base de datos
+     (siempre el caso fuera de claude.ai, ej. GitHub Pages). Sin esto, todo lo
+     cargado en MEMORIA VINCULADA se perdía al recargar o cerrar la página. */
+  var LOCAL_MEMORY_KEY = 'jarvis-local-memory-v1';
+
+  function saveLocalMemory(){
+    try {
+      localStorage.setItem(LOCAL_MEMORY_KEY, JSON.stringify({
+        projects: projects.filter(function(p){ return String(p.id).indexOf('local-project-') === 0; }),
+        memoryByProject: localMemoryByProject,
+        memorySeq: localMemorySeq,
+        projectSeq: localProjectSeq
+      }));
+    } catch (e) { /* almacenamiento no disponible, se sigue sin persistencia */ }
+  }
+
+  function loadLocalMemory(){
+    try {
+      var raw = localStorage.getItem(LOCAL_MEMORY_KEY);
+      if (!raw) return;
+      var data = JSON.parse(raw) || {};
+      if (data.memoryByProject && typeof data.memoryByProject === 'object'){
+        localMemoryByProject = data.memoryByProject;
+      }
+      if (!localMemoryByProject.general) localMemoryByProject.general = [];
+      if (Array.isArray(data.projects)){
+        data.projects.forEach(function(p){
+          if (p && p.id && !projects.some(function(existing){ return existing.id === p.id; })){
+            projects.push(p);
+          }
+        });
+      }
+      if (typeof data.memorySeq === 'number') localMemorySeq = data.memorySeq;
+      if (typeof data.projectSeq === 'number') localProjectSeq = data.projectSeq;
+    } catch (e) { /* ignore */ }
+  }
+
+  loadLocalMemory();
 
   var memoryListEl = document.getElementById('memory-list');
   var memoryCountLabel = document.getElementById('memory-count-label');
@@ -934,6 +973,7 @@
       var id = 'local-project-' + localProjectSeq;
       projects.push({ id: id, name: name });
       localMemoryByProject[id] = [];
+      saveLocalMemory();
       selectProject(id);
     }
     projectNewName.value = '';
@@ -948,6 +988,7 @@
       var arr = localArrayFor(currentProjectId);
       var idx = arr.findIndex(function(m){ return m.id === id; });
       if (idx !== -1) arr.splice(idx, 1);
+      saveLocalMemory();
       renderFiltered();
       touchUpdated();
     }
@@ -982,6 +1023,7 @@
       localMemorySeq += 1;
       payload.id = 'local-' + localMemorySeq;
       localArrayFor(currentProjectId).push(payload);
+      saveLocalMemory();
       renderFiltered();
       finish();
     }
@@ -1197,30 +1239,87 @@
     if (storedPref !== null) voiceEnabled = storedPref === '1';
   } catch (e) { /* storage unavailable — keep default */ }
 
+  /* Las voces del navegador se cargan de forma asíncrona: la primera llamada a
+     getVoices() suele devolver una lista vacía. Las cacheamos y las volvemos a
+     leer cuando el navegador avisa que ya están listas (onvoiceschanged). */
+  var cachedVoices = [];
+  function refreshVoices(){
+    if (!synth) return;
+    var v = synth.getVoices();
+    if (v && v.length) cachedVoices = v;
+  }
+  refreshVoices();
+  if (synth) { try { synth.onvoiceschanged = refreshVoices; } catch (e) { /* ignore */ } }
+
   function pickSpanishVoice(){
-    if (!synth) return null;
-    var voices = synth.getVoices() || [];
-    var es = voices.filter(function(v){ return /^es/i.test(v.lang); });
-    var esAr = es.find(function(v){ return /-AR$/i.test(v.lang); });
-    return esAr || es[0] || voices[0] || null;
+    if (!cachedVoices.length) return null;
+    var es = cachedVoices.filter(function(v){ return /^es/i.test(v.lang); });
+    // Preferimos voces "en la nube" (Google/Microsoft/Natural), que suenan mucho
+    // más naturales y menos robóticas que la voz local del sistema operativo.
+    var premium = es.filter(function(v){ return /google|microsoft|natural|online|neural/i.test(v.name); });
+    var esAr = (premium.filter(function(v){ return /-AR$/i.test(v.lang); })[0])
+      || (es.filter(function(v){ return /-AR$/i.test(v.lang); })[0]);
+    return esAr || premium[0] || es[0] || cachedVoices[0] || null;
   }
 
+  /* Convierte el texto de la respuesta (que puede traer markdown) a algo apto
+     para leer en voz alta: sin bloques de código, sin asteriscos/backticks/etc. */
+  function textForSpeech(text){
+    var out = String(text || '');
+    out = out.replace(/```[\s\S]*?```/g, ' Te dejo el detalle completo en pantalla. ');
+    out = out.replace(/`([^`]+)`/g, '$1');
+    out = out.replace(/\*\*([^*]+)\*\*/g, '$1');
+    out = out.replace(/\*([^*]+)\*/g, '$1');
+    out = out.replace(/__([^_]+)__/g, '$1');
+    out = out.replace(/_([^_]+)_/g, '$1');
+    out = out.replace(/^\s{0,3}#{1,6}\s*/gm, '');
+    out = out.replace(/^\s*[-*]\s+/gm, '');
+    return out.trim();
+  }
+
+  /* Separar en oraciones y encolarlas como utterances cortas en vez de una sola
+     gigante: cada oración sale con su entonación propia (más natural) y el
+     audio arranca antes en respuestas largas. */
+  function splitIntoSpeechChunks(text){
+    var chunks = text.match(/[^.!?\n]+[.!?]*(\n+|$)/g) || [text];
+    return chunks.map(function(c){ return c.trim(); }).filter(Boolean);
+  }
+
+  var speechQueue = [];
+
   function stopSpeaking(){
+    speechQueue = [];
     if (synth) { try { synth.cancel(); } catch (e) { /* ignore */ } }
+  }
+
+  function speakNextChunk(){
+    if (!synth || !speechQueue.length){
+      if (!isListening) setCoreState('idle');
+      return;
+    }
+    var chunk = speechQueue.shift();
+    try {
+      var utter = new SpeechSynthesisUtterance(chunk);
+      utter.lang = 'es-AR';
+      utter.rate = 1.04;
+      utter.pitch = 1.0;
+      var v = pickSpanishVoice();
+      if (v) utter.voice = v;
+      utter.onstart = function(){ setCoreState('speaking'); };
+      utter.onend = speakNextChunk;
+      utter.onerror = speakNextChunk;
+      synth.speak(utter);
+    } catch (e) { speakNextChunk(); }
   }
 
   function speak(text){
     if (!synth || !voiceEnabled || !text) return;
     stopSpeaking();
     try {
-      var utter = new SpeechSynthesisUtterance(text);
-      utter.lang = 'es-AR';
-      var v = pickSpanishVoice();
-      if (v) utter.voice = v;
-      utter.onstart = function(){ setCoreState('speaking'); };
-      utter.onend = function(){ if (!isListening) setCoreState('idle'); };
-      utter.onerror = function(){ if (!isListening) setCoreState('idle'); };
-      synth.speak(utter);
+      var clean = textForSpeech(text);
+      if (!clean) return;
+      speechQueue = splitIntoSpeechChunks(clean);
+      speakNextChunk();
     } catch (e) { /* speech synthesis failed — stay silent */ }
   }
 
@@ -1497,7 +1596,7 @@
         method: 'POST',
         signal: callOpts.signal,
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ system: systemTurn.content, messages: messages })
+        body: JSON.stringify({ system: systemTurn.content, messages: messages, stream: true })
       });
     }).then(function(res){
       if (!res.ok){
@@ -1508,16 +1607,55 @@
           return Promise.reject({ code: code, detail: errBody });
         });
       }
-      return res.json();
-    }).then(function(data){
-      var text = data.text || '';
-      if (callOpts.onText) callOpts.onText({ text: text });
-      return { text: text, truncated: false };
+      var ctype = res.headers.get('content-type') || '';
+      // El Worker puede responder en streaming (texto que va llegando de a
+      // partes, para que se vea escribir en tiempo real) o en un solo bloque
+      // JSON, según la versión desplegada — soportamos ambas.
+      if (ctype.indexOf('text/event-stream') !== -1 && res.body && res.body.getReader){
+        return readStreamedReply(res, callOpts);
+      }
+      return res.json().then(function(data){
+        var text = data.text || '';
+        if (callOpts.onText) callOpts.onText({ text: text });
+        return { text: text, truncated: false };
+      });
     }).catch(function(err){
       if (err && err.name === 'AbortError') return Promise.reject({ code:'cancelled' });
       if (err && err.code) return Promise.reject(err);
       return Promise.reject({ code:'upstream_error', detail: String(err) });
     });
+  }
+
+  function readStreamedReply(res, callOpts){
+    var reader = res.body.getReader();
+    var decoder = new TextDecoder();
+    var buffer = '';
+    var fullText = '';
+
+    function pump(){
+      return reader.read().then(function(step){
+        if (step.done) return { text: fullText, truncated: false };
+        buffer += decoder.decode(step.value, { stream: true });
+        var lines = buffer.split('\n');
+        buffer = lines.pop(); // línea incompleta: se completa en el próximo chunk
+        lines.forEach(function(line){
+          line = line.trim();
+          if (!line || line.indexOf('data:') !== 0) return;
+          var payload = line.slice(5).trim();
+          if (!payload || payload === '[DONE]') return;
+          try {
+            var json = JSON.parse(payload);
+            var delta = json.choices && json.choices[0] && json.choices[0].delta && json.choices[0].delta.content;
+            if (delta){
+              fullText += delta;
+              if (callOpts.onText) callOpts.onText({ text: fullText });
+            }
+          } catch (e) { /* fragmento incompleto todavía, se ignora */ }
+        });
+        return pump();
+      });
+    }
+    return pump();
   }
   bridgeSample.limits = function(){
     return Promise.resolve({ images: { mediaTypes: ['image/png','image/jpeg','image/webp'] } });
