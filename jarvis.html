@@ -583,6 +583,12 @@
 
   var OPERATOR_NAME = "Juan Turri";
 
+  /* ---------------- puente de IA para uso fuera de claude.ai (GitHub Pages) ----------------
+     Pegá acá la URL de tu Cloudflare Worker una vez que lo hayas desplegado
+     (ver jarvis-ai-bridge-worker.js). Mientras diga "https://broad-leaf-41a6jarvis-bridge.jperaltaturri.workers.dev", el núcleo de IA
+     queda desconectado en esta versión standalone, igual que antes. */
+  var AI_BRIDGE_URL = "https://TU-WORKER.workers.dev";
+
   /* ---------------- clock + greeting ---------------- */
   function updateClock(){
     var now = new Date();
@@ -1454,13 +1460,79 @@
     reportBtn.hidden = !downloads;
   }
 
+  /* ---------------- puente de IA (Cloudflare Worker) para fuera de claude.ai ---------------- */
+  function fileToBase64(file){
+    return new Promise(function(resolve, reject){
+      var reader = new FileReader();
+      reader.onload = function(){
+        var result = String(reader.result || '');
+        resolve(result.substring(result.indexOf(',') + 1));
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(file);
+    });
+  }
+
+  function bridgeSample(turns, callOpts){
+    var systemTurn = turns[0];
+    var rest = turns.slice(1);
+    var lastTurn = rest[rest.length - 1];
+    var priorTurns = rest.slice(0, -1);
+
+    function toMessage(t){ return { role: t.role, content: t.content }; }
+    var messages = priorTurns.map(toMessage);
+
+    var buildLast = (callOpts.images && callOpts.images.length)
+      ? fileToBase64(callOpts.images[0]).then(function(b64){
+          return { role:'user', content: [
+            { type:'text', text: lastTurn.content },
+            { type:'image', source: { type:'base64', media_type: callOpts.images[0].type || 'image/png', data: b64 } }
+          ]};
+        })
+      : Promise.resolve({ role:'user', content: lastTurn.content });
+
+    return buildLast.then(function(lastMsg){
+      messages.push(lastMsg);
+      return fetch(AI_BRIDGE_URL, {
+        method: 'POST',
+        signal: callOpts.signal,
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ system: systemTurn.content, messages: messages })
+      });
+    }).then(function(res){
+      if (!res.ok){
+        return res.json().catch(function(){ return {}; }).then(function(errBody){
+          var code = 'upstream_error';
+          if (res.status === 429) code = 'rate_limited';
+          if (res.status === 401 || res.status === 403) code = 'not_granted';
+          return Promise.reject({ code: code, detail: errBody });
+        });
+      }
+      return res.json();
+    }).then(function(data){
+      var text = data.text || '';
+      if (callOpts.onText) callOpts.onText({ text: text });
+      return { text: text, truncated: false };
+    }).catch(function(err){
+      if (err && err.name === 'AbortError') return Promise.reject({ code:'cancelled' });
+      if (err && err.code) return Promise.reject(err);
+      return Promise.reject({ code:'upstream_error', detail: String(err) });
+    });
+  }
+  bridgeSample.limits = function(){
+    return Promise.resolve({ images: { mediaTypes: ['image/png','image/jpeg','image/webp'] } });
+  };
+  function bridgeConfigured(){
+    return !!AI_BRIDGE_URL && AI_BRIDGE_URL.indexOf('TU-WORKER') === -1;
+  }
+
   if (window.claude && typeof window.claude.use === 'function'){
     window.claude.use('db').then(initDb).catch(function(){ initDb(null); });
     window.claude.use('sample').then(initSample).catch(function(){ initSample(null); });
     window.claude.use('downloads').then(initDownloads).catch(function(){ initDownloads(null); });
   } else {
     initDb(null);
-    initSample(null);
+    initSample(bridgeConfigured() ? bridgeSample : null);
     initDownloads(null);
   }
 
